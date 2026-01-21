@@ -10,14 +10,38 @@ function monthsBetween(a, b) {
 }
 
 async function calculateAccrued(user) {
-  const months = Math.max(0, monthsBetween(new Date(user.hireDate), new Date()));
-  const accrued = Math.min(18, months * 1.5);
+  // default to 18 days for everyone; keep calculation defensive
+  const DEFAULT_ANNUAL = 18;
+  let accrued = DEFAULT_ANNUAL;
+  try {
+    if (user && user.hireDate) {
+      const months = Math.max(0, monthsBetween(new Date(user.hireDate), new Date()));
+      accrued = Math.min(DEFAULT_ANNUAL, months * 1.5);
+      if (!Number.isFinite(accrued)) accrued = DEFAULT_ANNUAL;
+    }
+  } catch (e) {
+    accrued = DEFAULT_ANNUAL;
+  }
   const takenAgg = await Leave.aggregate([
     { $match: { applicant: user._id, status: 'Approved' } },
     { $group: { _id: null, total: { $sum: '$days' } } }
   ]);
   const taken = (takenAgg[0] && takenAgg[0].total) || 0;
-  return { accrued, taken, remaining: Math.max(0, accrued - taken) };
+  // prefer stored remaining in DB if present (keeps in-sync with apply/decline updates)
+  let remaining = Math.max(0, accrued - taken);
+  try {
+    if (user && user._id) {
+      const dbUser = await User.findById(user._id).select('annualEntitlement annualRemaining').lean();
+      if (dbUser) {
+        accrued = (typeof dbUser.annualEntitlement === 'number') ? dbUser.annualEntitlement : accrued;
+        if (typeof dbUser.annualRemaining === 'number') remaining = dbUser.annualRemaining;
+      }
+    }
+  } catch (e) {
+    // ignore and fall back to computed remaining
+  }
+
+  return { accrued, taken, remaining };
 }
 
 exports.applyLeave = async (req, res) => {
@@ -30,14 +54,33 @@ exports.applyLeave = async (req, res) => {
     const today = new Date();
     const todayDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     if (startDay <= todayDay) return res.status(400).json({ msg: 'Start date must be after today' });
-    const ms = 24*60*60*1000;
-    const days = Math.ceil((end - start) / ms) + 1;
-    if (days <= 0) return res.status(400).json({ msg: 'Invalid dates' });
+    // count weekdays only (exclude Saturday=6 and Sunday=0)
+    function countWeekdays(sDate, eDate) {
+      const s = new Date(sDate.getFullYear(), sDate.getMonth(), sDate.getDate());
+      const e = new Date(eDate.getFullYear(), eDate.getMonth(), eDate.getDate());
+      if (e < s) return 0;
+      let count = 0;
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        const day = d.getDay();
+        if (day !== 0 && day !== 6) count++;
+      }
+      return count;
+    }
+
+    const days = countWeekdays(start, end);
+    if (days <= 0) return res.status(400).json({ msg: 'Invalid dates (no weekdays in range)' });
     const user = req.user;
-    const accrual = await calculateAccrued(user);
+    // fetch fresh user doc to get stored remaining/entitlement
+    const dbUser = await User.findById(user._id);
+    const accrual = await calculateAccrued(dbUser || user);
     if (type === 'annual' && days > accrual.remaining) return res.status(400).json({ msg: 'Not enough annual leave remaining', remaining: accrual.remaining });
-    const leave = new Leave({ applicant: user._id, type, startDate: start, endDate: end, days, reason, department: user.department, manager: user.manager });
+    const leave = new Leave({ applicant: user._id, type, startDate: start, endDate: end, days, reason, department: dbUser ? dbUser.department : user.department, manager: dbUser ? dbUser.manager : user.manager });
     await leave.save();
+    // decrement stored remaining for annual leaves (persist entitlement)
+    if (type === 'annual' && dbUser) {
+      dbUser.annualRemaining = Math.max(0, (typeof dbUser.annualRemaining === 'number' ? dbUser.annualRemaining : dbUser.annualEntitlement || 18) - days);
+      try { await dbUser.save(); } catch (e) { console.error('Failed to update annualRemaining on apply:', e); }
+    }
     // notify manager (email + in-app notification)
     if (user.manager) {
       const manager = await User.findById(user.manager);
@@ -92,6 +135,18 @@ exports.declineLeave = async (req, res) => {
     if (!leave) return res.status(404).json({ msg: 'Leave not found' });
     if (req.user.role !== 'manager') return res.status(403).json({ msg: 'Forbidden' });
     if (String(leave.manager) !== String(req.user._id) && leave.applicant.manager && String(leave.applicant.manager) !== String(req.user._id)) return res.status(403).json({ msg: 'Not the manager for this employee' });
+    // if leave was pending and annual, restore the user's remaining entitlement
+    if (leave.status === 'Pending' && leave.type === 'annual') {
+      try {
+        const appl = await User.findById(leave.applicant._id || leave.applicant);
+        if (appl) {
+          appl.annualRemaining = Math.min(appl.annualEntitlement || 18, (typeof appl.annualRemaining === 'number' ? appl.annualRemaining : appl.annualEntitlement || 18) + leave.days);
+          await appl.save();
+        }
+      } catch (e) {
+        console.error('Failed to restore annualRemaining on decline:', e);
+      }
+    }
     leave.status = 'Declined';
     await leave.save();
     mailer.sendMail(leave.applicant.email, 'Leave declined', `Your leave (${leave.type}) from ${leave.startDate.toDateString()} to ${leave.endDate.toDateString()} was declined.`);
